@@ -4,9 +4,15 @@
 #
 # Images go to GHCR only: ghcr.io/<owner>/wallos
 #
-#   push to branch mod     -> :mod                    (rolling build of the branch)
+#   push to branch mod     -> :mod and :sha-<commit>  (rolling build of the branch)
 #   push tag mod-vX.Y.Z-N  -> :mod-vX.Y.Z-N, :latest  + a GitHub release
 #   pull request into mod  -> tests and build only, nothing is pushed
+#   manual run, tag input  -> releases an existing tag the same way
+#
+# A release does not rebuild when the commit it points to was already built:
+# the image built from that commit (:sha-<commit>, or :mod while it still is
+# that commit) is tagged as is, so the release is exactly the image that was
+# tested. Only a commit without an image is built from scratch.
 #
 # Tags: mod-v<upstream version>-<our release number>, e.g. mod-v5.11.1-1, then
 # mod-v5.11.1-2 for the next release on the same base, and mod-v5.12.0-1 once
@@ -25,6 +31,11 @@ on:
     branches:
       - mod
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release this existing mod-vX.Y.Z-N tag from the image already built for its commit (leave empty to build the branch)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -40,24 +51,77 @@ jobs:
     outputs:
       image: ${{ steps.vars.outputs.image }}
       is_release: ${{ steps.vars.outputs.is_release }}
+      release_tag: ${{ steps.vars.outputs.release_tag }}
+      mode: ${{ steps.vars.outputs.mode }}
+      source: ${{ steps.vars.outputs.source }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - id: vars
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           # GHCR wants a lower-case path, the owner is LemonZuo.
-          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/wallos" >> "$GITHUB_OUTPUT"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/wallos"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
 
+          tag=""
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            if [[ ! "$GITHUB_REF_NAME" =~ ^mod-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
-              echo "::error::Tag $GITHUB_REF_NAME does not match mod-vX.Y.Z-N (e.g. mod-v5.11.1-1)"
-              exit 1
-            fi
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            tag="$GITHUB_REF_NAME"
           fi
+          if [[ -n "$INPUT_TAG" ]]; then
+            tag="$INPUT_TAG"
+          fi
+
+          if [[ -z "$tag" ]]; then
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "mode=build" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ ! "$tag" =~ ^mod-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
+            echo "::error::Tag $tag does not match mod-vX.Y.Z-N (e.g. mod-v5.11.1-1)"
+            exit 1
+          fi
+          if ! commit=$(git rev-parse --verify --quiet "refs/tags/$tag^{commit}"); then
+            echo "::error::Tag $tag does not exist in this repository"
+            exit 1
+          fi
+          echo "is_release=true" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+
+          # Reuse the image already built from this commit, if there is one.
+          for ref in "$image:sha-${commit::7}" "$image:mod"; do
+            revision=$(docker buildx imagetools inspect "$ref" --format '{{ json (index .Image "linux/amd64").Config.Labels }}' 2>/dev/null \
+              | jq -r '."org.opencontainers.image.revision" // empty' || true)
+            if [[ "$revision" == "$commit" ]]; then
+              echo "Releasing $ref, built from $commit"
+              echo "mode=promote" >> "$GITHUB_OUTPUT"
+              echo "source=$ref" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          if [[ -n "$INPUT_TAG" ]]; then
+            # A manual run checks out the branch, not the tag, so it cannot build the tag itself.
+            echo "::error::No image was built from $commit ($tag). Push the tag again to build it."
+            exit 1
+          fi
+          echo "No image built from $commit yet, building it"
+          echo "mode=build" >> "$GITHUB_OUTPUT"
 
   test:
     runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.mode == 'build'
     container: php:8.3-cli
     steps:
       - uses: actions/checkout@v4
@@ -149,6 +213,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
+            type=sha,enable=${{ github.ref_type == 'branch' }}
           flavor: |
             latest=${{ needs.prepare.outputs.is_release }}
       - name: Create manifest list and push to GHCR
@@ -161,10 +226,35 @@ jobs:
       - name: Inspect image
         run: docker buildx imagetools inspect ${{ needs.prepare.outputs.image }}:${{ steps.meta.outputs.version }}
 
+  promote:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.mode == 'promote'
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Tag the existing image
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+          SOURCE: ${{ needs.prepare.outputs.source }}
+        run: |
+          # Same manifest list, same digest: no rebuild.
+          docker buildx imagetools create -t "$IMAGE:$TAG" -t "$IMAGE:latest" "$SOURCE"
+          docker buildx imagetools inspect "$IMAGE:$TAG"
+
   release:
     runs-on: ubuntu-latest
-    needs: [prepare, merge]
-    if: needs.prepare.outputs.is_release == 'true'
+    needs: [prepare, merge, promote]
+    if: >-
+      always() && needs.prepare.outputs.is_release == 'true' &&
+      (needs.merge.result == 'success' || needs.promote.result == 'success')
     steps:
       - uses: actions/checkout@v4
         with:
@@ -173,12 +263,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE: ${{ needs.prepare.outputs.image }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           # Compare against our previous release only, never against upstream's v* tags.
-          previous=$(git tag --list 'mod-v*' --sort=-v:refname | grep -vx "$GITHUB_REF_NAME" | head -n1 || true)
-          notes="Docker image: \`$IMAGE:$GITHUB_REF_NAME\` (also \`$IMAGE:latest\`)"
-          args=(--title "$GITHUB_REF_NAME" --notes "$notes" --generate-notes --verify-tag)
+          previous=$(git tag --list 'mod-v*' --sort=-v:refname | grep -vx "$TAG" | head -n1 || true)
+          notes="Docker image: \`$IMAGE:$TAG\` (also \`$IMAGE:latest\`)"
+          args=(--title "$TAG" --notes "$notes" --generate-notes --verify-tag)
           if [[ -n "$previous" ]]; then
             args+=(--notes-start-tag "$previous")
           fi
-          gh release create "$GITHUB_REF_NAME" "${args[@]}"
+          gh release create "$TAG" "${args[@]}"

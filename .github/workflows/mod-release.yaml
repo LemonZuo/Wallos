@@ -1,0 +1,184 @@
+# Release workflow for this fork. Upstream's build-release.yaml stays in the
+# tree untouched (so merging upstream never conflicts) and is disabled in the
+# repository's Actions settings instead; this file is the one that runs here.
+#
+# Images go to GHCR only: ghcr.io/<owner>/wallos
+#
+#   push to branch mod     -> :mod                    (rolling build of the branch)
+#   push tag mod-vX.Y.Z-N  -> :mod-vX.Y.Z-N, :latest  + a GitHub release
+#   pull request into mod  -> tests and build only, nothing is pushed
+#
+# Tags: mod-v<upstream version>-<our release number>, e.g. mod-v5.11.1-1, then
+# mod-v5.11.1-2 for the next release on the same base, and mod-v5.12.0-1 once
+# upstream v5.12.0 is merged. The mod- prefix keeps them out of upstream's v*
+# namespace, so syncing upstream tags never collides with ours and nothing that
+# matches v* (release-please included) ever picks ours up.
+name: Mod Build & Release
+
+on:
+  push:
+    branches:
+      - mod
+    tags:
+      - "mod-v*"
+  pull_request:
+    branches:
+      - mod
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      is_release: ${{ steps.vars.outputs.is_release }}
+    steps:
+      - id: vars
+        run: |
+          # GHCR wants a lower-case path, the owner is LemonZuo.
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/wallos" >> "$GITHUB_OUTPUT"
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^mod-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match mod-vX.Y.Z-N (e.g. mod-v5.11.1-1)"
+              exit 1
+            fi
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    container: php:8.3-cli
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the test suite
+        run: php tests/run.php
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [prepare, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+          - linux/arm/v7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.prepare.outputs.image }}
+      # necessary for multi-platform images
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # always resolve php:8.3-fpm-alpine fresh, so a rebuild picks up base image security fixes
+          pull: true
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', needs.prepare.outputs.image) }}
+          # Scope cache per platform to prevent architecture-mismatched layers
+          cache-from: type=gha,scope=${{ github.workflow }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ matrix.platform }}
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || matrix.platform == 'linux/arm64' && 'arm64' || 'armv7' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.prepare.outputs.image }}
+          # The image tag is the git tag itself, so the two never need translating.
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+          flavor: |
+            latest=${{ needs.prepare.outputs.is_release }}
+      - name: Create manifest list and push to GHCR
+        working-directory: /tmp/digests
+        run: |
+          # shellcheck disable=SC2046 # one argument per tag and per digest
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ needs.prepare.outputs.image }}@sha256:%s ' *)
+      - name: Inspect image
+        run: docker buildx imagetools inspect ${{ needs.prepare.outputs.image }}:${{ steps.meta.outputs.version }}
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [prepare, merge]
+    if: needs.prepare.outputs.is_release == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
+        run: |
+          # Compare against our previous release only, never against upstream's v* tags.
+          previous=$(git tag --list 'mod-v*' --sort=-v:refname | grep -vx "$GITHUB_REF_NAME" | head -n1 || true)
+          notes="Docker image: \`$IMAGE:$GITHUB_REF_NAME\` (also \`$IMAGE:latest\`)"
+          args=(--title "$GITHUB_REF_NAME" --notes "$notes" --generate-notes --verify-tag)
+          if [[ -n "$previous" ]]; then
+            args+=(--notes-start-tag "$previous")
+          fi
+          gh release create "$GITHUB_REF_NAME" "${args[@]}"

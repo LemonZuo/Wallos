@@ -21,6 +21,7 @@ require 'settimezone.php';
 require_once __DIR__ . '/../../includes/webhook_headers.php';
 require_once __DIR__ . '/../../includes/subscription_payers.php';
 require_once __DIR__ . '/../../includes/subscription_categories.php';
+require_once __DIR__ . '/../../includes/email_template.php';
 
 if (php_sapi_name() == 'cli') {
     $date = new DateTime('now');
@@ -33,6 +34,9 @@ if (php_sapi_name() == 'cli') {
 $query = "SELECT id, username, language FROM user";
 $stmt = $db->prepare($query);
 $usersToNotify = $stmt->execute();
+// Linked in the footer of the notification emails when the instance has one.
+$emailServerUrl = wallos_get_admin_settings($db)['server_url'] ?? '';
+
 $periodSummaryColumnCheck = $db->query("SELECT * FROM pragma_table_info('notification_settings') WHERE name='period_summary_at_period_start'");
 $hasPeriodSummaryColumn = $periodSummaryColumnCheck && $periodSummaryColumnCheck->fetchArray(SQLITE3_ASSOC);
 
@@ -93,6 +97,69 @@ function buildNotificationMessage($name, $perUser, $periodSummaryLine, $includeP
     }
 
     return $message;
+}
+
+function getDueBadgeTone($days)
+{
+    if ($days <= 0) {
+        return 'danger';
+    }
+    return $days == 1 ? 'warning' : 'info';
+}
+
+/**
+ * The HTML version of buildNotificationMessage(), which stays the plain-text
+ * alternative.
+ *
+ * @return array ['html' => string, 'images' => array cid => path]
+ */
+function buildNotificationEmail($perUser, $periodSummaryItems, $includePeriodSummary, $language, $serverUrl)
+{
+    global $i18n;
+
+    $images = [];
+    $content = '';
+    $names = [];
+
+    if (!empty($perUser)) {
+        $items = [];
+        foreach ($perUser as $subscription) {
+            $names[] = $subscription['name'];
+            $items[] = [
+                'name' => $subscription['name'],
+                'price' => $subscription['formatted_price'],
+                'logo' => $subscription['logo'] ?? '',
+                'badge' => [
+                    'text' => getDaysText($subscription['days']),
+                    'tone' => getDueBadgeTone($subscription['days']),
+                ],
+                'details' => [
+                    translate('next_payment', $i18n) . ' ' . $subscription['date'],
+                    $subscription['category'] ?? '',
+                    !empty($subscription['payer']) ? translate('paid_by', $i18n) . ' ' . $subscription['payer'] : '',
+                ],
+            ];
+        }
+        $content .= wallos_email_subscription_list($items, $images);
+    }
+
+    if ($includePeriodSummary && !empty($periodSummaryItems)) {
+        $content .= '<div style="height:16px;line-height:16px;font-size:16px;">&nbsp;</div>' . wallos_email_summary($periodSummaryItems);
+    }
+
+    $html = wallos_email_layout([
+        'lang' => $language,
+        'title' => translate('wallos_notification', $i18n),
+        'preheader' => !empty($names)
+            ? implode(' · ', array_map(fn($name) => html_entity_decode($name, ENT_QUOTES, 'UTF-8'), $names))
+            : implode(' · ', array_map(fn($row) => $row[0] . ': ' . $row[1], $periodSummaryItems)),
+        'heading' => !empty($perUser) ? translate('upcoming_payments', $i18n) : translate('amount_for_pay_period', $i18n),
+        'intro' => !empty($perUser) ? translate('notification_renewals_intro', $i18n) : '',
+        'content' => $content,
+        'server_url' => $serverUrl,
+    ]);
+
+    return ['html' => $html, 'images' => $images];
 }
 
 while ($userToNotify = $usersToNotify->fetchArray(SQLITE3_ASSOC)) {
@@ -377,12 +444,14 @@ while ($userToNotify = $usersToNotify->fetchArray(SQLITE3_ASSOC)) {
         $amountNeededThisPeriod = computeAmountNeededInPeriod($periodSubscriptions, $currentDate, $activeBudgetPeriod['end'], $db, $userId);
         $mainCurrencyCode = $currencies[$mainCurrencyId]['code'] ?? 'USD';
         $mainCurrencySymbol = $currencies[$mainCurrencyId]['symbol'] ?? '$';
-        $periodSummaryLine = translate('amount_for_pay_period', $i18n) . ": " . formatPrice($amountNeededThisPeriod, $mainCurrencyCode, $mainCurrencySymbol);
+        $periodSummaryItems = [[translate('amount_for_pay_period', $i18n), formatPrice($amountNeededThisPeriod, $mainCurrencyCode, $mainCurrencySymbol)]];
 
         if (!empty($userBudgetConfig['period_budget']) && $userBudgetConfig['period_budget'] > 0) {
             $remaining = max(0, $userBudgetConfig['period_budget'] - $amountNeededThisPeriod);
-            $periodSummaryLine .= " | " . translate('remaining', $i18n) . ": " . formatPrice($remaining, $mainCurrencyCode, $mainCurrencySymbol);
+            $periodSummaryItems[] = [translate('remaining', $i18n), formatPrice($remaining, $mainCurrencyCode, $mainCurrencySymbol)];
         }
+
+        $periodSummaryLine = implode(" | ", array_map(fn($item) => $item[0] . ": " . $item[1], $periodSummaryItems));
 
         $sendPeriodStartSummaryOnly = $periodSummaryAtPeriodStart === 1 && $isPeriodStart;
 
@@ -427,6 +496,7 @@ while ($userToNotify = $usersToNotify->fetchArray(SQLITE3_ASSOC)) {
                     'days' => $daysToCompare,
                     'url' => $rowSubscription['url'],
                     'notes' => $rowSubscription['notes'],
+                    'logo' => $rowSubscription['logo'] ?? '',
                 ];
                 // Every channel hears about it once, under the primary payer.
                 // Email goes to each payer on their own address, see $notifyEmail.
@@ -537,7 +607,8 @@ while ($userToNotify = $usersToNotify->fetchArray(SQLITE3_ASSOC)) {
                         }
 
                         $mail->Subject = translate('wallos_notification', $i18n);
-                        $mail->Body = $message;
+                        $emailContent = buildNotificationEmail($perUser, $periodSummaryItems, $sendPeriodStartSummaryOnly, $userLanguage, $emailServerUrl);
+                        wallos_email_apply($mail, $emailContent['html'], $message, $emailContent['images']);
 
                         if ($mail->send()) {
                             echo "Email Notifications sent<br />";

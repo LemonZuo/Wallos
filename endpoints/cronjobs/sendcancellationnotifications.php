@@ -11,17 +11,32 @@ require_once __DIR__ . '/../../includes/webhook_helper.php';
 require __DIR__ . '/../../libs/PHPMailer/PHPMailer.php';
 require __DIR__ . '/../../libs/PHPMailer/SMTP.php';
 require __DIR__ . '/../../libs/PHPMailer/Exception.php';
+require __DIR__ . '/../../includes/currency_formatter.php';
 
 require 'settimezone.php';
 require_once __DIR__ . '/../../includes/webhook_headers.php';
 require_once __DIR__ . '/../../includes/subscription_payers.php';
 require_once __DIR__ . '/../../includes/subscription_categories.php';
 require_once __DIR__ . '/../../includes/instance_config.php';
+require_once __DIR__ . '/../../includes/email_template.php';
 
 // Get all user ids
 $query = "SELECT id, username, language FROM user";
 $stmt = $db->prepare($query);
 $usersToNotify = $stmt->execute();
+
+// Same formatting as the renewal cron, so both emails show prices alike.
+function formatPrice($price, $currencyCode, $currencySymbol)
+{
+    $formattedPrice = CurrencyFormatter::format($price, $currencyCode);
+
+    if (strpos($formattedPrice, $currencyCode) !== false) {
+        $formattedPrice = str_replace($currencyCode, $currencySymbol . ' ', $formattedPrice);
+        $formattedPrice = preg_replace('/\s+/', ' ', $formattedPrice);
+    }
+
+    return $formattedPrice;
+}
 
 function buildCancellationMessage($name, $perUser)
 {
@@ -43,6 +58,51 @@ function buildCancellationMessage($name, $perUser)
 
     return $message;
 }
+
+/**
+ * The HTML version of buildCancellationMessage(), which stays the plain-text
+ * alternative.
+ *
+ * @return array ['html' => string, 'images' => array cid => path]
+ */
+function buildCancellationEmail($perUser, $language, $serverUrl)
+{
+    global $i18n;
+
+    $images = [];
+    $items = [];
+    $names = [];
+    foreach ($perUser as $subscription) {
+        $names[] = html_entity_decode($subscription['name'], ENT_QUOTES, 'UTF-8');
+        $items[] = [
+            'name' => $subscription['name'],
+            'price' => $subscription['formatted_price'] ?? $subscription['price'],
+            'logo' => $subscription['logo'] ?? '',
+            // The cron runs on the cancellation date itself.
+            'badge' => ['text' => translate('notification_due_today', $i18n), 'tone' => 'danger'],
+            'details' => [
+                translate('next_payment', $i18n) . ' ' . $subscription['date'],
+                $subscription['category'] ?? '',
+                !empty($subscription['payer']) ? translate('paid_by', $i18n) . ' ' . $subscription['payer'] : '',
+            ],
+        ];
+    }
+
+    $html = wallos_email_layout([
+        'lang' => $language,
+        'title' => translate('wallos_cancellation_notification', $i18n),
+        'preheader' => implode(' · ', $names),
+        'heading' => translate('upcoming_cancellations', $i18n),
+        'intro' => translate('notification_cancellation_intro', $i18n),
+        'content' => wallos_email_subscription_list($items, $images),
+        'server_url' => $serverUrl,
+    ]);
+
+    return ['html' => $html, 'images' => $images];
+}
+
+// Linked in the footer of the notification emails when the instance has one.
+$emailServerUrl = wallos_get_admin_settings($db)['server_url'] ?? '';
 
 while ($userToNotify = $usersToNotify->fetchArray(SQLITE3_ASSOC)) {
     $userId = $userToNotify['id'];
@@ -238,12 +298,14 @@ while ($userToNotify = $usersToNotify->fetchArray(SQLITE3_ASSOC)) {
             $entry = [
                 'name' => $rowSubscription['name'],
                 'price' => $rowSubscription['price'] . $currencies[$rowSubscription['currency_id']]['symbol'],
+                'formatted_price' => formatPrice($rowSubscription['price'], $currencies[$rowSubscription['currency_id']]['code'], $currencies[$rowSubscription['currency_id']]['symbol']),
                 'currency' => $currencies[$rowSubscription['currency_id']]['name'],
                 'category' => payerNamesLabel(getCategoriesBySubscription($db, [$rowSubscription])[$rowSubscription['id']] ?? [], array_map(fn($category) => $category['name'], $categories)) ?: $categories[$rowSubscription['category_id']]['name'],
                 'payer' => payerNamesLabel($allPayerIds, array_map(fn($member) => $member['name'], $household)) ?: $household[$rowSubscription['payer_user_id']]['name'],
                 'date' => $rowSubscription['next_payment'],
                 'url' => $rowSubscription['url'],
                 'notes' => $rowSubscription['notes'],
+                'logo' => $rowSubscription['logo'] ?? '',
             ];
             // Every channel hears about it once, under the primary payer.
             // Email goes to each payer on their own address, see $notifyEmail.
@@ -335,7 +397,8 @@ while ($userToNotify = $usersToNotify->fetchArray(SQLITE3_ASSOC)) {
                         }
 
                         $mail->Subject = translate('wallos_cancellation_notification', $i18n);
-                        $mail->Body = $message;
+                        $emailContent = buildCancellationEmail($perUser, $userLanguage, $emailServerUrl);
+                        wallos_email_apply($mail, $emailContent['html'], $message, $emailContent['images']);
 
                         if ($mail->send()) {
                             echo "Email Notifications sent<br />";

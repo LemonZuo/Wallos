@@ -8,6 +8,7 @@ require_once '../../includes/connect_endpoint.php';
 require_once '../../includes/validate_endpoint.php';
 require_once '../../includes/ssrf_helper.php';
 require_once '../../includes/instance_config.php';
+require_once '../../includes/email_template.php';
 
 $postData = file_get_contents("php://input");
 $data = json_decode($postData, true);
@@ -99,7 +100,19 @@ if (
     $mail->addAddress($email, $name);
 
     $mail->Subject = translate('wallos_notification', $i18n);
-    $mail->Body = translate('test_notification', $i18n);
+    $testSuccess = '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:separate;background-color:#ECFDF5;border-radius:12px;">'
+        . '<tr><td width="40" valign="top" style="padding:16px 0 16px 16px;width:40px;">'
+        . '<div style="width:28px;height:28px;border-radius:14px;background-color:#10B981;color:#FFFFFF;font-size:16px;line-height:28px;font-weight:700;text-align:center;">&#10003;</div>'
+        . '</td><td style="padding:16px 16px 16px 12px;font-size:15px;line-height:24px;color:#065F46;">' . wallos_email_text(translate('test_notification', $i18n)) . '</td></tr></table>';
+    $html = wallos_email_layout([
+        'lang' => $lang,
+        'title' => $mail->Subject,
+        'preheader' => translate('test_notification', $i18n),
+        'heading' => translate('wallos_notification', $i18n),
+        'content' => $testSuccess,
+        'server_url' => wallos_get_admin_settings($db)['server_url'] ?? '',
+    ]);
+    wallos_email_apply($mail, $html, translate('test_notification', $i18n));
 
     try {
         if ($mail->send()) {

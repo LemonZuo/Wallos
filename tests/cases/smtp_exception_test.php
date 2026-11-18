@@ -4,6 +4,7 @@ namespace WallosSmtpTest;
 require_once WALLOS_ROOT . '/libs/PHPMailer/Exception.php';
 require_once WALLOS_ROOT . '/libs/PHPMailer/PHPMailer.php';
 require_once WALLOS_ROOT . '/libs/PHPMailer/SMTP.php';
+require_once WALLOS_ROOT . '/includes/email_template.php';
 
 class UnavailableSmtp extends \PHPMailer\PHPMailer\SMTP
 {
@@ -49,6 +50,7 @@ class Database
 
 function validate_smtp_host(...$args) { return true; }
 function buildNotificationMessage(...$args) { return 'Renewal reminder'; }
+function buildNotificationEmail(...$args) { return ['html' => '<p>Renewal reminder</p>', 'images' => []]; }
 function mb_convert_encoding($value, ...$args) { return $value; }
 function error_log($message) { $GLOBALS['wallos_smtp_logs'][] = $message; }
 function curl_init($url = null) { return $url; }
@@ -88,6 +90,9 @@ function dispatch($mode, $invalidSender = false)
     $notify = $notifyEmail = [1 => [['name' => 'Subscription']], 2 => [['name' => 'Other']]];
     $notifyOtherPayers = [];
     $periodSummaryLine = '';
+    $periodSummaryItems = [];
+    $userLanguage = 'en';
+    $emailServerUrl = '';
     $sendPeriodStartSummaryOnly = false;
     $email = ['smtpAddress' => 'smtp.example.com', 'smtpPort' => 587,
         'smtpUsername' => 'user', 'smtpPassword' => 'secret', 'encryption' => 'none',

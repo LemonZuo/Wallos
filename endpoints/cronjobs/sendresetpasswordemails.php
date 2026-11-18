@@ -8,6 +8,7 @@ require_once __DIR__ . '/../../includes/connect_endpoint_crontabs.php';
 
 require 'settimezone.php';
 require_once __DIR__ . '/../../includes/instance_config.php';
+require_once __DIR__ . '/../../includes/email_template.php';
 
 // The admin row with anything the deployment owns applied over it, so this job
 // uses the same mail server the admin page shows.
@@ -56,13 +57,20 @@ if ($rows) {
         try {
             foreach ($rows as $user) {
                 $mail->addAddress($user['email']);
-                $mail->isHTML(true);
                 $mail->Subject = 'Wallos - Reset Password';
-                $mail->Body = '<img src="' . $server_url . '/images/siteicons/wallos.png" alt="Logo" />
-                    <br>
-                    A password reset was requested for your account.
-                    <br>
-                    Please click the following link to reset your password: <a href="' . $server_url . '/passwordreset.php?email=' . $user['email'] . '&token=' . $user['token'] . '">Reset Password</a>';
+                $resetUrl = $server_url . '/passwordreset.php?email=' . $user['email'] . '&token=' . $user['token'];
+                $html = wallos_email_layout([
+                    'title' => $mail->Subject,
+                    'preheader' => 'Use the link inside to choose a new password for your Wallos account.',
+                    'heading' => 'Reset your password',
+                    'intro' => "A password reset was requested for your account.\nClick the button below to choose a new password.",
+                    'button' => ['label' => 'Reset Password', 'url' => $resetUrl],
+                    'link_hint' => "If the button doesn't work, copy and paste this link into your browser:",
+                    'note' => "If you didn't request a password reset, you can safely ignore this email. Your password will not change.",
+                    'server_url' => $server_url,
+                ]);
+                $text = "A password reset was requested for your account.\n\nPlease open the following link to reset your password:\n" . $resetUrl;
+                wallos_email_apply($mail, $html, $text);
 
                 $mail->send();
 

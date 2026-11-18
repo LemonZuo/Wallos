@@ -8,6 +8,7 @@ require_once __DIR__ . '/../../includes/connect_endpoint_crontabs.php';
 
 require 'settimezone.php';
 require_once __DIR__ . '/../../includes/instance_config.php';
+require_once __DIR__ . '/../../includes/email_template.php';
 
 // The admin row with anything the deployment owns applied over it, so this job
 // uses the same mail server the admin page shows.
@@ -63,13 +64,20 @@ if ($rows) {
         try {
             foreach ($rows as $user) {
                 $mail->addAddress($user['email']);
-                $mail->isHTML(true);
                 $mail->Subject = 'Wallos - Email Verification';
-                $mail->Body = '<img src="' . $server_url . '/images/siteicons/wallos.png" alt="Logo" />
-                    <br>
-                    Registration on Wallos was successful.
-                    <br>
-                    Please click the following link to verify your email: <a href="' . $server_url . '/verifyemail.php?email=' . $user['email'] . '&token=' . $user['token'] . '">Verify Email</a>';
+                $verifyUrl = $server_url . '/verifyemail.php?email=' . $user['email'] . '&token=' . $user['token'];
+                $html = wallos_email_layout([
+                    'title' => $mail->Subject,
+                    'preheader' => 'Confirm your email address to finish setting up your Wallos account.',
+                    'heading' => 'Verify your email',
+                    'intro' => "Registration on Wallos was successful.\nPlease confirm your email address by clicking the button below.",
+                    'button' => ['label' => 'Verify Email', 'url' => $verifyUrl],
+                    'link_hint' => "If the button doesn't work, copy and paste this link into your browser:",
+                    'note' => "If you didn't create a Wallos account, you can safely ignore this email.",
+                    'server_url' => $server_url,
+                ]);
+                $text = "Registration on Wallos was successful.\n\nPlease open the following link to verify your email:\n" . $verifyUrl;
+                wallos_email_apply($mail, $html, $text);
 
                 $mail->send();
 
